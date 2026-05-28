@@ -46,4 +46,4 @@ Useful options:
 ## Notes
 
 - The target OpenProject project must already have the types `Test` and `Test Step` available.
-- The `result` column in the step table is intentionally left blank.
+- The step table includes `Action`, `Data`, `Expected Result`, `Result 1`, and `Result 2` columns.

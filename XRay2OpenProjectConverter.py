@@ -28,7 +28,7 @@ import json
 import os
 import sys
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
@@ -86,6 +86,25 @@ def normalize_text(value: Any) -> str:
     return str(value).replace("\r\n", "\n").replace("\r", "\n")
 
 
+def response_text(response: requests.Response) -> str:
+    text = normalize_text(response.text).strip()
+    return text if text else "<empty response body>"
+
+
+def openproject_connection_error(url: str, exc: Exception) -> RuntimeError:
+    parsed = urlparse(url)
+    host = parsed.hostname or url
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    scheme = parsed.scheme or "http"
+    message = (
+        f"Cannot connect to OpenProject at {url}: {exc}. "
+        f"Check the scheme ({scheme}), host ({host}), port ({port}), and network/VPN reachability."
+    )
+    if scheme == "http":
+        message += " If OpenProject uses TLS, try https:// instead of http://."
+    return RuntimeError(message)
+
+
 def escape_table_cell(value: Any) -> str:
     text = normalize_text(value)
     if not text:
@@ -96,9 +115,9 @@ def escape_table_cell(value: Any) -> str:
 def step_description_table(step: Dict[str, Any]) -> str:
     return "\n".join(
         [
-            "| action | data | expected results | result |",
-            "| --- | --- | --- | --- |",
-            f"| {escape_table_cell(step.get('action'))} | {escape_table_cell(step.get('data'))} | {escape_table_cell(step.get('result'))} |  |",
+            "| Action | Data | Expected Result | Result 1 | Result 2 |",
+            "| --- | --- | --- | --- | --- |",
+            f"| {escape_table_cell(step.get('action'))} | {escape_table_cell(step.get('data'))} | {escape_table_cell(step.get('result'))} |  |  |",
         ]
     )
 
@@ -150,7 +169,14 @@ def authenticate_xray(base_url: str, client_id: str, client_secret: str) -> str:
         json={"client_id": client_id, "client_secret": client_secret},
         timeout=60,
     )
-    response.raise_for_status()
+    if not response.ok:
+        if response.status_code == 401:
+            raise RuntimeError(
+                "Xray authentication failed with 401 Unauthorized. "
+                "Check XRAY_CLIENT_ID, XRAY_CLIENT_SECRET, and XRAY_BASE_URL for the correct tenant/region. "
+                f"Response: {response_text(response)}"
+            )
+        raise RuntimeError(f"Xray authentication failed with {response.status_code}: {response_text(response)}")
     token = response.json()
     if not isinstance(token, str) or not token:
         raise RuntimeError(f"Unexpected authentication response: {token!r}")
@@ -290,29 +316,58 @@ def session_with_auth(api_token: str, auth_mode: str, username: Optional[str] = 
     return session
 
 
-def raise_for_openproject_error(response: requests.Response) -> None:
+def raise_for_openproject_error(
+    response: requests.Response,
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> None:
+    hint = ""
+    if response.status_code == 401:
+        if auth_mode == "bearer":
+            hint = " If your OpenProject token is an API token, try --auth-mode basic --username apikey."
+        elif auth_mode == "basic":
+            hint = f" Check the username ({username or 'apikey'}) and token for this OpenProject instance."
+
     try:
         payload = response.json()
     except Exception:
-        response.raise_for_status()
-        return
+        message = normalize_text(response.text).strip() or response.reason or "<no response body>"
+        raise RuntimeError(f"OpenProject API error {response.status_code}: {message}{hint}")
 
     message = payload.get("message") or payload.get("error") or response.text
+    if response.status_code == 401:
+        message = f"{message}{hint}"
     raise RuntimeError(f"OpenProject API error {response.status_code}: {message}")
 
 
-def api_get(session: requests.Session, url: str) -> Dict[str, Any]:
-    response = session.get(url, timeout=60)
+def api_get(session: requests.Session, url: str, auth_mode: str, username: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        response = session.get(url, timeout=60)
+    except requests.exceptions.ConnectionError as exc:
+        raise openproject_connection_error(url, exc) from exc
+    except requests.exceptions.Timeout as exc:
+        raise openproject_connection_error(url, exc) from exc
     if response.ok:
         return response.json()
-    raise_for_openproject_error(response)
+    raise_for_openproject_error(response, auth_mode, username)
 
 
-def api_post(session: requests.Session, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    response = session.post(url, json=payload, timeout=60)
+def api_post(
+    session: requests.Session,
+    url: str,
+    payload: Dict[str, Any],
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        response = session.post(url, json=payload, timeout=60)
+    except requests.exceptions.ConnectionError as exc:
+        raise openproject_connection_error(url, exc) from exc
+    except requests.exceptions.Timeout as exc:
+        raise openproject_connection_error(url, exc) from exc
     if response.ok:
         return response.json()
-    raise_for_openproject_error(response)
+    raise_for_openproject_error(response, auth_mode, username)
 
 
 def project_href(project_ref: str) -> str:
@@ -329,15 +384,26 @@ def absolute_url(openproject_url: str, href: str) -> str:
     return urljoin(openproject_url.rstrip("/") + "/", href.lstrip("/"))
 
 
-def resolve_project_href(session: requests.Session, openproject_url: str, project_ref: str) -> str:
+def resolve_project_href(
+    session: requests.Session,
+    openproject_url: str,
+    project_ref: str,
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> str:
     if project_ref.isdigit():
         return project_href(project_ref)
 
     url = projects_collection_url(openproject_url)
     while url:
-        response = session.get(url, timeout=60)
+        try:
+            response = session.get(url, timeout=60)
+        except requests.exceptions.ConnectionError as exc:
+            raise openproject_connection_error(url, exc) from exc
+        except requests.exceptions.Timeout as exc:
+            raise openproject_connection_error(url, exc) from exc
         if not response.ok:
-            raise_for_openproject_error(response)
+            raise_for_openproject_error(response, auth_mode, username)
 
         payload = response.json()
         elements = (payload.get("_embedded") or {}).get("elements") or []
@@ -360,10 +426,16 @@ def resolve_project_href(session: requests.Session, openproject_url: str, projec
     raise RuntimeError(f"Project not found in OpenProject: {project_ref!r}")
 
 
-def list_project_types(session: requests.Session, openproject_url: str, project_ref: str) -> List[Dict[str, Any]]:
-    project_link = resolve_project_href(session, openproject_url, project_ref)
+def list_project_types(
+    session: requests.Session,
+    openproject_url: str,
+    project_ref: str,
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    project_link = resolve_project_href(session, openproject_url, project_ref, auth_mode, username)
     url = f"{openproject_url.rstrip('/')}{project_link}/types"
-    payload = api_get(session, url)
+    payload = api_get(session, url, auth_mode, username)
     embedded = payload.get("_embedded") or {}
     elements = embedded.get("elements") or []
     if not isinstance(elements, list):
@@ -388,6 +460,8 @@ def create_work_package(
     type_href: str,
     subject: str,
     description: str,
+    auth_mode: str,
+    username: Optional[str] = None,
     parent_href: Optional[str] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
@@ -403,7 +477,7 @@ def create_work_package(
         payload["_links"]["parent"] = {"href": parent_href}
 
     url = f"{openproject_url.rstrip('/')}{project_link}/work_packages"
-    return api_post(session, url, payload)
+    return api_post(session, url, payload, auth_mode, username)
 
 
 def tests_to_import(tests: List[Dict[str, Any]], source_project_filter: Optional[str]) -> List[Dict[str, Any]]:
@@ -424,9 +498,11 @@ def import_tests(
     target_project: str,
     tests: List[Dict[str, Any]],
     dry_run: bool,
+    auth_mode: str,
+    username: Optional[str] = None,
 ) -> None:
-    project_link = resolve_project_href(session, openproject_url, target_project)
-    types = list_project_types(session, openproject_url, target_project)
+    project_link = resolve_project_href(session, openproject_url, target_project, auth_mode, username)
+    types = list_project_types(session, openproject_url, target_project, auth_mode, username)
     test_type_href = find_type_href(types, "Test")
     step_type_href = find_type_href(types, "Test Step")
 
@@ -459,6 +535,8 @@ def import_tests(
                 type_href=test_type_href,
                 subject=parent_subject,
                 description=parent_description,
+                auth_mode=auth_mode,
+                username=username,
             )
         created_tests += 1
 
@@ -479,6 +557,8 @@ def import_tests(
                     type_href=step_type_href,
                     subject=step_subject,
                     description=step_description,
+                    auth_mode=auth_mode,
+                    username=username,
                     parent_href=parent_href,
                 )
             created_steps += 1
@@ -535,9 +615,13 @@ def main() -> int:
 
     print(f"CSV: {args.csv}", file=sys.stderr)
     print(f"JSON: {args.json}", file=sys.stderr)
+    print(
+        f"Connecting to OpenProject: {openproject_url} (auth mode: {auth_mode}, username: {username if auth_mode == 'basic' else 'n/a'})",
+        file=sys.stderr,
+    )
 
     session = session_with_auth(api_token, auth_mode, username)
-    import_tests(session, openproject_url, args.target_project, tests, args.dry_run)
+    import_tests(session, openproject_url, args.target_project, tests, args.dry_run, auth_mode, username)
     return 0
 
 
