@@ -15,10 +15,12 @@ Copy `.env.example` to `.env` and fill in your credentials. The script loads `.e
 ## Full Sync
 
 ```powershell
-python XRay2OpenProjectConverter.py --jql "project = 'Lab OS' AND issuetype = Test" --source-project-name "Lab OS" --target-project demo
+python XRay2OpenProjectConverter.py --source-project-name "Lab OS" --target-project demo
 ```
 
 Useful options:
+- `--jql` defaults to `issuetype IN ('Test', 'Test Execution', 'Test Plan', 'Test Set', 'Test Case')`
+- Omit `--source-project-name` and/or `--target-project` to select them interactively
 - `--csv xray_test_steps.csv` and `--json xray_test_steps.json` to change export paths
 - `--dry-run` to print actions without creating anything
 - `--page-size 100` to control Xray pagination
@@ -34,6 +36,7 @@ Useful options:
 - `OPENPROJECT_API_TOKEN`
 - `OPENPROJECT_AUTH_MODE`
 - `OPENPROJECT_USERNAME`
+- `OPENPROJECT_RESULT_COLUMN_LABEL` (optional, label or `customFieldN` key for the Test Step result table field)
 
 ## Behavior
 
@@ -41,9 +44,12 @@ Useful options:
 - Writes CSV and JSON exports
 - Creates one parent OpenProject work package of type `Test` per test
 - Creates child work packages of type `Test Step` for each step
-- Writes a Markdown table into each step description
+- Writes the result table into `description` by default
+- Writes the result table into the configured Test Step custom field when `OPENPROJECT_RESULT_COLUMN_LABEL` is set
 
 ## Notes
 
 - The target OpenProject project must already have the types `Test` and `Test Step` available.
-- The step table includes `Action`, `Data`, `Expected Result`, `Result 1`, and `Result 2` columns.
+- The step table includes `Action`, `Data`, `Expected`, `Result`, `Result 1`, `Date/Version`, `Tester`, `Result 2`, `Date/Version`, and `Tester` columns.
+- Set `OPENPROJECT_RESULT_COLUMN_LABEL` to the custom field label or exact `customFieldN` key used on `Test Step` if you want to store the table in a custom field.
+- Leave it unset to store the table in the built-in `description` field.

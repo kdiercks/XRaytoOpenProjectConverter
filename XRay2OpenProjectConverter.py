@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import quote, urljoin, urlparse
@@ -37,6 +38,7 @@ from env_loader import load_dotenv
 
 DEFAULT_XRAY_BASE_URL = "https://xray.cloud.getxray.app"
 DEFAULT_OPENPROJECT_URL = "https://openproject.example.com"
+DEFAULT_XRAY_JQL = "issuetype IN ('Test', 'Test Execution', 'Test Plan', 'Test Set', 'Test Case')"
 
 
 GET_TESTS_QUERY = """
@@ -112,14 +114,124 @@ def escape_table_cell(value: Any) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
 
+def result_custom_field_selector() -> Optional[str]:
+    selector = normalize_text(os.getenv("OPENPROJECT_RESULT_COLUMN_LABEL")).strip()
+    return selector or None
+
+
 def step_description_table(step: Dict[str, Any]) -> str:
     return "\n".join(
         [
-            "| Action | Data | Expected Result | Result 1 | Result 2 |",
-            "| --- | --- | --- | --- | --- |",
-            f"| {escape_table_cell(step.get('action'))} | {escape_table_cell(step.get('data'))} | {escape_table_cell(step.get('result'))} |  |  |",
+            "| Action | Data | Expected | Result | Result 1 | Date/Version | Tester | Result 2 | Date/Version | Tester |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            f"| {escape_table_cell(step.get('action'))} | {escape_table_cell(step.get('data'))} | {escape_table_cell(step.get('result'))} |  |  |  |  |  |  |  |",
         ]
     )
+
+
+def project_id_from_href(project_link: str) -> str:
+    match = re.search(r"/projects/(\d+)", project_link)
+    if not match:
+        raise RuntimeError(f"Cannot extract project id from link: {project_link!r}")
+    return match.group(1)
+
+
+def type_id_from_href(type_href: str) -> str:
+    match = re.search(r"/types/(\d+)", type_href)
+    if not match:
+        raise RuntimeError(f"Cannot extract type id from link: {type_href!r}")
+    return match.group(1)
+
+
+def work_package_schema_url(openproject_url: str, project_link: str, type_href: str) -> str:
+    project_id = project_id_from_href(project_link)
+    type_id = type_id_from_href(type_href)
+    identifier = f"{project_id}-{type_id}"
+    return f"{openproject_url.rstrip('/')}/api/v3/work_packages/schemas/{identifier}"
+
+
+def work_package_form_url(openproject_url: str) -> str:
+    return f"{openproject_url.rstrip('/')}/api/v3/work_packages/form"
+
+
+def fetch_work_package_form_schema(
+    session: requests.Session,
+    openproject_url: str,
+    project_link: str,
+    type_href: str,
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "_links": {
+            "project": {"href": project_link},
+            "type": {"href": type_href},
+        }
+    }
+    response = api_post(session, work_package_form_url(openproject_url), payload, auth_mode, username)
+    embedded = response.get("_embedded") or {}
+    schema = embedded.get("schema")
+    if not isinstance(schema, dict):
+        raise RuntimeError("Unexpected OpenProject work package form response")
+    return schema
+
+
+def resolve_result_custom_field_key(
+    session: requests.Session,
+    openproject_url: str,
+    project_link: str,
+    type_href: str,
+    selector: str,
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> str:
+    schema = fetch_work_package_form_schema(session, openproject_url, project_link, type_href, auth_mode, username)
+
+    def warn_fallback(reason: str) -> str:
+        print(f"Warning: {reason}. Falling back to {selector!r}.", file=sys.stderr)
+        return selector
+
+    if re.fullmatch(r"customField\d+", selector):
+        field = schema.get(selector)
+        if not isinstance(field, dict):
+            return warn_fallback(f"Custom field {selector!r} was not present on the Test Step schema")
+        if normalize_text(field.get("location")).strip() == "_links":
+            return warn_fallback(
+                f"Custom field {selector!r} is linked and may not accept the result table text"
+            )
+        return selector
+
+    wanted = normalize_text(selector).strip().lower()
+    matches: List[str] = []
+
+    for key, value in schema.items():
+        if not re.fullmatch(r"customField\d+", key):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if normalize_text(value.get("name")).strip().lower() == wanted:
+            matches.append(key)
+
+    if not matches:
+        return warn_fallback(f"Custom field {selector!r} was not found on the Test Step schema")
+
+    if len(matches) > 1:
+        return warn_fallback(f"Custom field label {selector!r} is ambiguous on the Test Step schema: {', '.join(matches)}")
+
+    field = schema[matches[0]]
+    if isinstance(field, dict) and normalize_text(field.get("location")).strip() == "_links":
+        return warn_fallback(
+            f"Custom field {selector!r} resolves to a linked field and may not accept the result table text"
+        )
+
+    return matches[0]
+
+
+def custom_field_value(field_schema: Dict[str, Any], value: str) -> Any:
+    field_type = normalize_text(field_schema.get("type"))
+    if field_type == "Formattable":
+        return {"format": "markdown", "raw": value, "html": ""}
+    return value
 
 
 def flatten_jira_fields(jira_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -384,6 +496,95 @@ def absolute_url(openproject_url: str, href: str) -> str:
     return urljoin(openproject_url.rstrip("/") + "/", href.lstrip("/"))
 
 
+def list_openproject_projects(
+    session: requests.Session,
+    openproject_url: str,
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    url = projects_collection_url(openproject_url)
+    projects: List[Dict[str, Any]] = []
+
+    while url:
+        try:
+            response = session.get(url, timeout=60)
+        except requests.exceptions.ConnectionError as exc:
+            raise openproject_connection_error(url, exc) from exc
+        except requests.exceptions.Timeout as exc:
+            raise openproject_connection_error(url, exc) from exc
+        if not response.ok:
+            raise_for_openproject_error(response, auth_mode, username)
+
+        payload = response.json()
+        elements = (payload.get("_embedded") or {}).get("elements") or []
+        if not isinstance(elements, list):
+            raise RuntimeError("Unexpected OpenProject projects response")
+        projects.extend(elements)
+
+        next_link = (payload.get("_links") or {}).get("nextByOffset") or {}
+        href = next_link.get("href")
+        url = absolute_url(openproject_url, href) if href else None
+
+    return projects
+
+
+def prompt_select_option(title: str, options: List[str]) -> int:
+    if not options:
+        raise RuntimeError(f"No options available for {title}")
+    if len(options) == 1:
+        return 1
+    if not sys.stdin.isatty():
+        raise RuntimeError(f"{title} is required but not provided and no interactive terminal is available")
+
+    print(f"Select {title}:", file=sys.stderr)
+    for index, option in enumerate(options, start=1):
+        print(f"  {index}. {option}", file=sys.stderr)
+
+    while True:
+        choice = input(f"Enter {title} number [1-{len(options)}]: ").strip()
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(options):
+                return index
+        print("Invalid selection.", file=sys.stderr)
+
+
+def prompt_source_project_name(tests: List[Dict[str, Any]], explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        return explicit
+
+    names = sorted({source_project_name(test) for test in tests if source_project_name(test)})
+    if not names:
+        return None
+    return names[prompt_select_option("source project", names) - 1]
+
+
+def prompt_target_project_name(
+    session: requests.Session,
+    openproject_url: str,
+    auth_mode: str,
+    username: Optional[str] = None,
+) -> str:
+    projects = list_openproject_projects(session, openproject_url, auth_mode, username)
+    labels = []
+    refs = []
+    for project in projects:
+        identifier = normalize_text(project.get("identifier"))
+        name = normalize_text(project.get("name"))
+        ref = identifier or name
+        if not ref:
+            continue
+        if identifier and name and identifier != name:
+            labels.append(f"{identifier} - {name}")
+        else:
+            labels.append(ref)
+        refs.append(ref)
+    if not labels:
+        raise RuntimeError("No OpenProject projects available to select")
+    selected_index = prompt_select_option("destination project", labels)
+    return refs[selected_index - 1]
+
+
 def resolve_project_href(
     session: requests.Session,
     openproject_url: str,
@@ -460,18 +661,24 @@ def create_work_package(
     type_href: str,
     subject: str,
     description: str,
+    custom_fields: Optional[Dict[str, Any]],
     auth_mode: str,
     username: Optional[str] = None,
     parent_href: Optional[str] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "subject": subject,
-        "description": {"format": "markdown", "raw": description},
         "_links": {
             "project": {"href": project_link},
             "type": {"href": type_href},
         },
     }
+
+    if description:
+        payload["description"] = {"format": "markdown", "raw": description}
+
+    if custom_fields:
+        payload.update(custom_fields)
 
     if parent_href:
         payload["_links"]["parent"] = {"href": parent_href}
@@ -505,6 +712,25 @@ def import_tests(
     types = list_project_types(session, openproject_url, target_project, auth_mode, username)
     test_type_href = find_type_href(types, "Test")
     step_type_href = find_type_href(types, "Test Step")
+    result_field_selector = result_custom_field_selector()
+    result_field_key = None
+    result_field_schema = None
+    if result_field_selector:
+        step_form_schema = fetch_work_package_form_schema(
+            session, openproject_url, project_link, step_type_href, auth_mode, username
+        )
+        result_field_key = resolve_result_custom_field_key(
+            session=session,
+            openproject_url=openproject_url,
+            project_link=project_link,
+            type_href=step_type_href,
+            selector=result_field_selector,
+            auth_mode=auth_mode,
+            username=username,
+        )
+        result_field_schema = step_form_schema.get(result_field_key)
+        if not isinstance(result_field_schema, dict):
+            raise RuntimeError(f"Resolved custom field schema is missing for {result_field_key!r}")
 
     created_tests = 0
     created_steps = 0
@@ -535,6 +761,7 @@ def import_tests(
                 type_href=test_type_href,
                 subject=parent_subject,
                 description=parent_description,
+                custom_fields=None,
                 auth_mode=auth_mode,
                 username=username,
             )
@@ -546,7 +773,13 @@ def import_tests(
 
         for index, step in enumerate(steps, start=1):
             step_subject = f"{key} - Step {index}"
-            step_description = step_description_table(step)
+            step_table = step_description_table(step)
+            step_description = "" if result_field_key else step_table
+            step_custom_fields = (
+                {result_field_key: custom_field_value(result_field_schema, step_table)}
+                if result_field_key and result_field_schema
+                else None
+            )
 
             print(f"  Creating Test Step: {step_subject}", file=sys.stderr)
             if not dry_run:
@@ -557,6 +790,7 @@ def import_tests(
                     type_href=step_type_href,
                     subject=step_subject,
                     description=step_description,
+                    custom_fields=step_custom_fields,
                     auth_mode=auth_mode,
                     username=username,
                     parent_href=parent_href,
@@ -569,9 +803,13 @@ def import_tests(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export Xray tests and import them into OpenProject.")
-    parser.add_argument("--jql", required=True, help='JQL selecting the Xray Test issues, e.g. "project = ABC AND issuetype = Test"')
+    parser.add_argument(
+        "--jql",
+        default=DEFAULT_XRAY_JQL,
+        help=f'JQL selecting the Xray Test issues. Default: {DEFAULT_XRAY_JQL!r}',
+    )
     parser.add_argument("--source-project-name", default=None, help="Optional source project name filter from the exported tests.")
-    parser.add_argument("--target-project", required=True, help="OpenProject target project identifier or numeric ID.")
+    parser.add_argument("--target-project", default=None, help="OpenProject target project identifier or numeric ID. If omitted, you will be prompted.")
     parser.add_argument("--openproject-url", default=None, help=f"OpenProject base URL. Default: OPENPROJECT_URL or {DEFAULT_OPENPROJECT_URL}")
     parser.add_argument("--csv", default="xray_test_steps.csv", help="CSV export path. Default: xray_test_steps.csv")
     parser.add_argument("--json", default="xray_test_steps.json", help="JSON export path. Default: xray_test_steps.json")
@@ -598,13 +836,16 @@ def main() -> int:
     client_id = require_env("XRAY_CLIENT_ID")
     client_secret = require_env("XRAY_CLIENT_SECRET")
     api_token = require_env("OPENPROJECT_API_TOKEN")
+    session = session_with_auth(api_token, auth_mode, username)
+    target_project = args.target_project or prompt_target_project_name(session, openproject_url, auth_mode, username)
 
     print("Authenticating against Xray Cloud...", file=sys.stderr)
     token = authenticate_xray(xray_base_url, client_id, client_secret)
 
     print(f"Exporting tests using JQL: {args.jql}", file=sys.stderr)
     tests = fetch_all_tests(xray_base_url, token, args.jql, page_size=args.page_size)
-    tests = tests_to_import(tests, args.source_project_name)
+    source_project_name_filter = prompt_source_project_name(tests, args.source_project_name)
+    tests = tests_to_import(tests, source_project_name_filter)
 
     rows: List[Dict[str, Any]] = []
     for test in tests:
@@ -620,8 +861,7 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    session = session_with_auth(api_token, auth_mode, username)
-    import_tests(session, openproject_url, args.target_project, tests, args.dry_run, auth_mode, username)
+    import_tests(session, openproject_url, target_project, tests, args.dry_run, auth_mode, username)
     return 0
 
 
