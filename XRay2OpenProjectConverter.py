@@ -6,7 +6,7 @@ This script performs the full pipeline:
 1. Export tests from Xray via GraphQL
 2. Optionally write CSV/JSON exports
 3. Create a parent OpenProject work package of type "Test" for each test
-4. Create child work packages of type "Test Step" for each step
+4. Create child work packages of type "Test Step" for each step and map the Xray step fields into OpenProject fields
 
 Credentials are read from the environment:
 - XRAY_CLIENT_ID
@@ -114,19 +114,78 @@ def escape_table_cell(value: Any) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
 
-def result_custom_field_selector() -> Optional[str]:
-    selector = normalize_text(os.getenv("OPENPROJECT_RESULT_COLUMN_LABEL")).strip()
-    return selector or None
+STEP_FIELD_ENV_VARS = {
+    "description": "OPENPROJECT_STEP_DESCRIPTION_LABEL",
+    "data": "OPENPROJECT_STEP_DATA_LABEL",
+    "expected": "OPENPROJECT_STEP_EXPECTED_LABEL",
+    "result": "OPENPROJECT_STEP_RESULT_LABEL",
+}
 
 
-def step_description_table(step: Dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            "| Action | Data | Expected | Result | Result 1 | Date/Version | Tester | Result 2 | Date/Version | Tester |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-            f"| {escape_table_cell(step.get('action'))} | {escape_table_cell(step.get('data'))} | {escape_table_cell(step.get('result'))} |  |  |  |  |  |  |  |",
-        ]
-    )
+def step_field_labels() -> Dict[str, str]:
+    return {
+        "description": normalize_text(os.getenv(STEP_FIELD_ENV_VARS["description"], "Test Step Description")).strip(),
+        "data": normalize_text(os.getenv(STEP_FIELD_ENV_VARS["data"], "Test Step Data")).strip(),
+        "expected": normalize_text(os.getenv(STEP_FIELD_ENV_VARS["expected"], "Test Step Expected")).strip(),
+        "result": normalize_text(os.getenv(STEP_FIELD_ENV_VARS["result"], "Test Step Result")).strip(),
+    }
+
+
+def resolve_custom_field_key_from_schema(schema: Dict[str, Any], selector: str) -> Optional[str]:
+    if re.fullmatch(r"customField\d+", selector):
+        field = schema.get(selector)
+        if not isinstance(field, dict):
+            print(f"Warning: Custom field {selector!r} was not present on the Test Step schema", file=sys.stderr)
+            return None
+        if normalize_text(field.get("location")).strip() == "_links":
+            print(
+                f"Warning: Custom field {selector!r} is linked and may not accept the step value",
+                file=sys.stderr,
+            )
+            return None
+        return selector
+
+    wanted = normalize_text(selector).strip().lower()
+    matches: List[str] = []
+
+    for key, value in schema.items():
+        if not re.fullmatch(r"customField\d+", key):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if normalize_text(value.get("name")).strip().lower() == wanted:
+            matches.append(key)
+
+    if not matches:
+        print(f"Warning: Custom field {selector!r} was not found on the Test Step schema", file=sys.stderr)
+        return None
+
+    if len(matches) > 1:
+        print(
+            f"Warning: Custom field label {selector!r} is ambiguous on the Test Step schema: {', '.join(matches)}",
+            file=sys.stderr,
+        )
+        return None
+
+    field = schema[matches[0]]
+    if isinstance(field, dict) and normalize_text(field.get("location")).strip() == "_links":
+        print(
+            f"Warning: Custom field {selector!r} resolves to a linked field and may not accept the step value",
+            file=sys.stderr,
+        )
+        return None
+
+    return matches[0]
+
+
+def resolve_step_custom_field_keys(
+    schema: Dict[str, Any],
+) -> Dict[str, Optional[str]]:
+    labels = step_field_labels()
+    return {
+        field_name: resolve_custom_field_key_from_schema(schema, label)
+        for field_name, label in labels.items()
+    }
 
 
 def project_id_from_href(project_link: str) -> str:
@@ -176,62 +235,39 @@ def fetch_work_package_form_schema(
     return schema
 
 
-def resolve_result_custom_field_key(
-    session: requests.Session,
-    openproject_url: str,
-    project_link: str,
-    type_href: str,
-    selector: str,
-    auth_mode: str,
-    username: Optional[str] = None,
-) -> str:
-    schema = fetch_work_package_form_schema(session, openproject_url, project_link, type_href, auth_mode, username)
-
-    def warn_fallback(reason: str) -> str:
-        print(f"Warning: {reason}. Falling back to {selector!r}.", file=sys.stderr)
-        return selector
-
-    if re.fullmatch(r"customField\d+", selector):
-        field = schema.get(selector)
-        if not isinstance(field, dict):
-            return warn_fallback(f"Custom field {selector!r} was not present on the Test Step schema")
-        if normalize_text(field.get("location")).strip() == "_links":
-            return warn_fallback(
-                f"Custom field {selector!r} is linked and may not accept the result table text"
-            )
-        return selector
-
-    wanted = normalize_text(selector).strip().lower()
-    matches: List[str] = []
-
-    for key, value in schema.items():
-        if not re.fullmatch(r"customField\d+", key):
-            continue
-        if not isinstance(value, dict):
-            continue
-        if normalize_text(value.get("name")).strip().lower() == wanted:
-            matches.append(key)
-
-    if not matches:
-        return warn_fallback(f"Custom field {selector!r} was not found on the Test Step schema")
-
-    if len(matches) > 1:
-        return warn_fallback(f"Custom field label {selector!r} is ambiguous on the Test Step schema: {', '.join(matches)}")
-
-    field = schema[matches[0]]
-    if isinstance(field, dict) and normalize_text(field.get("location")).strip() == "_links":
-        return warn_fallback(
-            f"Custom field {selector!r} resolves to a linked field and may not accept the result table text"
-        )
-
-    return matches[0]
-
-
 def custom_field_value(field_schema: Dict[str, Any], value: str) -> Any:
     field_type = normalize_text(field_schema.get("type"))
     if field_type == "Formattable":
         return {"format": "markdown", "raw": value, "html": ""}
     return value
+
+
+def step_custom_fields(
+    step: Dict[str, Any],
+    schema: Dict[str, Any],
+    field_keys: Dict[str, Optional[str]],
+    leave_result_empty: bool,
+) -> Dict[str, Any]:
+    values = {
+        "description": normalize_text(step.get("action")),
+        "data": normalize_text(step.get("data")),
+        "expected": normalize_text(step.get("result")),
+        "result": "" if leave_result_empty else normalize_text(step.get("result")),
+    }
+
+    custom_fields: Dict[str, Any] = {}
+    for field_name, field_key in field_keys.items():
+        if not field_key:
+            continue
+        field_schema = schema.get(field_key)
+        if not isinstance(field_schema, dict):
+            continue
+        value = values[field_name]
+        if not value:
+            continue
+        custom_fields[field_key] = custom_field_value(field_schema, value)
+
+    return custom_fields
 
 
 def flatten_jira_fields(jira_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -575,7 +611,7 @@ def prompt_target_project_name(
         if not ref:
             continue
         if identifier and name and identifier != name:
-            labels.append(f"{identifier} - {name}")
+            labels.append(f"{name} ({identifier})")
         else:
             labels.append(ref)
         refs.append(ref)
@@ -707,30 +743,14 @@ def import_tests(
     dry_run: bool,
     auth_mode: str,
     username: Optional[str] = None,
+    leave_step_result_empty: bool = False,
 ) -> None:
     project_link = resolve_project_href(session, openproject_url, target_project, auth_mode, username)
     types = list_project_types(session, openproject_url, target_project, auth_mode, username)
     test_type_href = find_type_href(types, "Test")
     step_type_href = find_type_href(types, "Test Step")
-    result_field_selector = result_custom_field_selector()
-    result_field_key = None
-    result_field_schema = None
-    if result_field_selector:
-        step_form_schema = fetch_work_package_form_schema(
-            session, openproject_url, project_link, step_type_href, auth_mode, username
-        )
-        result_field_key = resolve_result_custom_field_key(
-            session=session,
-            openproject_url=openproject_url,
-            project_link=project_link,
-            type_href=step_type_href,
-            selector=result_field_selector,
-            auth_mode=auth_mode,
-            username=username,
-        )
-        result_field_schema = step_form_schema.get(result_field_key)
-        if not isinstance(result_field_schema, dict):
-            raise RuntimeError(f"Resolved custom field schema is missing for {result_field_key!r}")
+    step_form_schema = fetch_work_package_form_schema(session, openproject_url, project_link, step_type_href, auth_mode, username)
+    step_field_keys = resolve_step_custom_field_keys(step_form_schema)
 
     created_tests = 0
     created_steps = 0
@@ -773,12 +793,11 @@ def import_tests(
 
         for index, step in enumerate(steps, start=1):
             step_subject = f"{key} - Step {index}"
-            step_table = step_description_table(step)
-            step_description = "" if result_field_key else step_table
-            step_custom_fields = (
-                {result_field_key: custom_field_value(result_field_schema, step_table)}
-                if result_field_key and result_field_schema
-                else None
+            step_custom_field_values = step_custom_fields(
+                step,
+                step_form_schema,
+                step_field_keys,
+                leave_step_result_empty,
             )
 
             print(f"  Creating Test Step: {step_subject}", file=sys.stderr)
@@ -789,8 +808,8 @@ def import_tests(
                     project_link=project_link,
                     type_href=step_type_href,
                     subject=step_subject,
-                    description=step_description,
-                    custom_fields=step_custom_fields,
+                    description="",
+                    custom_fields=step_custom_field_values or None,
                     auth_mode=auth_mode,
                     username=username,
                     parent_href=parent_href,
@@ -816,6 +835,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--page-size", type=int, default=100, help="Xray page size. Xray Cloud max is 100. Default: 100")
     parser.add_argument("--auth-mode", choices=["bearer", "basic"], default=None, help="OpenProject auth mode. Default: OPENPROJECT_AUTH_MODE or bearer")
     parser.add_argument("--username", default=None, help="OpenProject username for basic auth. Default: OPENPROJECT_USERNAME or apikey")
+    parser.add_argument(
+        "--leave-step-result-empty",
+        action="store_true",
+        help="Leave the OpenProject field 'Test Step Result' empty instead of copying Xray result.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print actions without creating anything.")
     return parser.parse_args()
 
@@ -861,7 +885,16 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    import_tests(session, openproject_url, target_project, tests, args.dry_run, auth_mode, username)
+    import_tests(
+        session,
+        openproject_url,
+        target_project,
+        tests,
+        args.dry_run,
+        auth_mode,
+        username,
+        args.leave_step_result_empty,
+    )
     return 0
 
 
